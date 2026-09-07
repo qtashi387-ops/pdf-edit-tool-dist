@@ -1,0 +1,12 @@
+name = "pdf-edit-tool-dist"
+main = "index.js"
+compatibility_date = "2026-09-07"
+compatibility_flags = ["global_fetch_strictly_public"]
+
+# Serves every file in this repo (version.txt, index.html, manual_version.txt,
+# the manual docx) as a static asset at its own root-relative path -- no
+# custom request handling needed, index.js below only exists because
+# Cloudflare Workers still requires a `main` entry point even when the
+# actual job is 100% static-asset serving.
+[assets]
+directory = "./"
