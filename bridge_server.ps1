@@ -34,6 +34,10 @@
 # パスにしか書き込めないよう制限している(下記参照)。
 
 param(
+  # この既定値は起動時に-Portで上書きされるので実際は使われない
+  # (open_in_pdf_editor.ps1が明示的に指定する)が、単独起動時のフォール
+  # バックとしても合わせておく必要がある -- 変更する場合はopen_in_pdf_editor.ps1
+  # の$Portも必ず同じ値に変更すること。
   [int]$Port = 8743
 )
 
@@ -45,8 +49,11 @@ $ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # このサーバーが/__load経由で実際に渡したパス(元のパスと、ダウンロード
 # ボタンが同じフォルダへの保存に使う"_編集済み"派生パスの両方)。/__save は
 # これに含まれるパスにしか書き込まない -- ループバックポートを直接叩く
-# 他のローカルプロセスに対する多層防御。
-$Script:ServedPaths = New-Object 'System.Collections.Generic.HashSet[string]'
+# 他のローカルプロセスに対する多層防御。Windowsのパスは大文字小文字を
+# 区別しないため、既定の(大文字小文字を区別する)比較のままだと将来
+# どこかで大文字小文字の違うパス文字列が渡された場合に正規の保存が
+# 誤って拒否され得る -- OrdinalIgnoreCaseで構築する。
+$Script:ServedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
 # フォントキー -> 既に抽出済みのバイト列。同じシステムフォントで再選択/
 # 再エクスポートするたびに(数MBの)元ファイルを読み直さないためのキャッシュ。
@@ -150,13 +157,19 @@ function Find-FaceIndex([byte[]]$Buf, [string]$TargetFamily) {
   return -1
 }
 
-function Get-SfntChecksum([byte[]]$Data) {
+# SFNTのテーブルは4バイト境界にゼロパディングされる必要がある --
+# チェックサム計算(Get-SfntChecksum)とテーブル本体の再パック(Extract-Face)の
+# 両方で同じパディングが必要になるため、共通ヘルパーに切り出す。
+function Get-PaddedTo4Bytes([byte[]]$Data) {
   $pad = (4 - ($Data.Length % 4)) % 4
-  if ($pad -gt 0) {
-    $padded = New-Object byte[] ($Data.Length + $pad)
-    [Array]::Copy($Data, $padded, $Data.Length)
-    $Data = $padded
-  }
+  if ($pad -eq 0) { return $Data }
+  $padded = New-Object byte[] ($Data.Length + $pad)
+  [Array]::Copy($Data, $padded, $Data.Length)
+  return $padded
+}
+
+function Get-SfntChecksum([byte[]]$Data) {
+  $Data = Get-PaddedTo4Bytes $Data
   # PowerShellは0xFFFFFFFFのような0x7FFFFFFFを超える16進リテラルを符号付き
   # Int32(つまり-1)として解釈するため、"-band 0xFFFFFFFF"による32bitマスクは
   # 実質no-opになり、合計がuint32の範囲を超えた際にキャスト例外を起こす。
@@ -208,12 +221,7 @@ function Extract-Face([byte[]]$Buf, [int]$FaceIndex) {
   foreach ($e in $entries) {
     $data = New-Object byte[] $e.Length
     [Array]::Copy($Buf, $e.Offset, $data, 0, $e.Length)
-    $pad = (4 - ($data.Length % 4)) % 4
-    if ($pad -gt 0) {
-      $padded = New-Object byte[] ($data.Length + $pad)
-      [Array]::Copy($data, $padded, $data.Length)
-      $data = $padded
-    }
+    $data = Get-PaddedTo4Bytes $data
     $newEntries += [PSCustomObject]@{ Tag = $e.Tag; Checksum = $e.Checksum; Offset = $cursor; Length = $e.Length }
     $bodyChunks.Add($data)
     $cursor += $data.Length
@@ -308,14 +316,19 @@ function Test-FromThisToolsOwnPage([System.Net.HttpListenerRequest]$Request) {
   return $true
 }
 
-function Send-JsonResponse([System.Net.HttpListenerResponse]$Response, [int]$StatusCode, [hashtable]$Obj) {
+function Send-JsonResponse([System.Net.HttpListenerResponse]$Response, [int]$StatusCode, [hashtable]$Obj, [System.Net.HttpListenerRequest]$Request) {
   $json = $Obj | ConvertTo-Json -Compress -Depth 10
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
   $Response.StatusCode = $StatusCode
   $Response.ContentType = "application/json; charset=utf-8"
   $Response.Headers.Add("Cache-Control", "no-store")
   $Response.ContentLength64 = $bytes.Length
-  $Response.OutputStream.Write($bytes, 0, $bytes.Length)
+  # Send-Error/Handle-StaticFileと同じ理由でHEADは本文を書かない。今のルーティング
+  # ではHEADがこの関数まで届くことはないが(HEAD/GETは常にHandle-StaticFileへ)、
+  # 将来ここへ届く経路が増えても同じ抜けを再発させないための一貫した防御。
+  if (-not $Request -or $Request.HttpMethod -ne "HEAD") {
+    $Response.OutputStream.Write($bytes, 0, $bytes.Length)
+  }
   $Response.OutputStream.Close()
 }
 
@@ -368,7 +381,7 @@ function Handle-Load([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
     filename = [System.IO.Path]::GetFileName($pdfPath)
     path     = $pdfPath
     data     = [Convert]::ToBase64String($data)
-  }
+  } $Request
 }
 
 function Handle-Font([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
@@ -387,7 +400,7 @@ function Handle-Font([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
     $Script:FontCache[$key] = $data
   }
 
-  Send-JsonResponse $Response 200 @{ name = $key; data = [Convert]::ToBase64String($data) }
+  Send-JsonResponse $Response 200 @{ name = $key; data = [Convert]::ToBase64String($data) } $Request
 }
 
 function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
@@ -456,16 +469,22 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
     return
   }
 
-  Send-JsonResponse $Response 200 @{ ok = $true }
+  Send-JsonResponse $Response 200 @{ ok = $true } $Request
 }
 
 function Handle-StaticFile([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
   $relPath = [Uri]::UnescapeDataString($Request.Url.AbsolutePath.TrimStart('/'))
   if ([string]::IsNullOrEmpty($relPath)) { $relPath = "index.html" }
   $fullPath = Join-Path $ToolDir $relPath
-  # ディレクトリトラバーサル対策 -- 解決後のパスが必ずToolDir配下にあることを確認
+  # ディレクトリトラバーサル対策 -- 解決後のパスが必ずToolDir配下にあることを確認。
+  # $resolvedRootの末尾に必ず区切り文字を付けてからStartsWithする -- 付けないと
+  # 「文字列としてToolDirを前方一致するだけの兄弟フォルダ/ファイル」(例:
+  # 「開発用ソース」に対する「開発用ソース_backup」)も配下と誤判定してしまう。
   $resolvedFull = [System.IO.Path]::GetFullPath($fullPath)
   $resolvedRoot = [System.IO.Path]::GetFullPath($ToolDir)
+  if (-not $resolvedRoot.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+    $resolvedRoot += [System.IO.Path]::DirectorySeparatorChar
+  }
   if (-not $resolvedFull.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
     Send-Error $Response 403 "forbidden" $Request; return
   }
