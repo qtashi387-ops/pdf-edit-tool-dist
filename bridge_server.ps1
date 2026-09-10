@@ -1,14 +1,16 @@
-﻿# PDF編集ツール - ローカル橋渡しサーバー(PowerShell版、試作)
+﻿# PDF編集ツール - ローカル橋渡しサーバー(PowerShell版)
 #
-# server.py(PdfEditorServer.exeのビルド元)と全く同じ役割を、コンパイル不要な
-# PowerShellスクリプトとして再実装したもの。目的は、この橋渡しサーバー自体を
-# 今後index.html/マニュアルと同じ「ダウンロードしてローカルファイルを上書きする」
-# 自動更新の仕組みに乗せられるようにすること(コンパイル済みEXEはこの方式に
-# 乗せられないため、今は修正のたびに手動での再配布が必要になっている)。
+# 旧server.py(旧PdfEditorServer.exeのビルド元、2026-09-10に削除)と全く同じ
+# 役割を、コンパイル不要なPowerShellスクリプトとして再実装したもの。目的は、
+# この橋渡しサーバー自体をindex.html/マニュアルと同じ「ダウンロードして
+# ローカルファイルを上書きする」自動更新の仕組みに乗せられるようにすること
+# (コンパイル済みEXEはこの方式に乗せられず、修正のたびに手動での再配布が
+# 必要だった)。
 #
-# 現時点では試作段階 -- open_in_pdf_editor.vbs はまだこのファイルを起動する
-# ようには変更していない。既存のPdfEditorServer.exeと機能を突き合わせて
-# 動作確認を終えてから切り替えを検討する。
+# 2026-09-10、実機での動作確認・server.pyとのバイト単位の突き合わせ検証を
+# 終え、open_in_pdf_editor.ps1(旧open_in_pdf_editor.vbsの後継)から起動する
+# 本番の橋渡しサーバーとして既に切り替え済み。以後の更新は
+# update_checker.ps1が自動配布する。
 #
 # 127.0.0.1のみでリッスン(ネットワークからは到達不可)。index.htmlを通常の
 # 静的ファイルとして配信するほか、3つの追加エンドポイントを持つ:
@@ -371,8 +373,11 @@ function Handle-Load([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
 
 function Handle-Font([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
   $qs = [System.Web.HttpUtility]::ParseQueryString($Request.Url.Query)
+  # nameパラメータ自体が無いと$qs["name"]は$nullを返し、Hashtable.ContainsKey($null)
+  # は(存在しないキーとしてFalseを返すのではなく)例外を投げる -- 先に
+  # $nullチェックしてから渡す。
   $key = $qs["name"]
-  if (-not $FontDefs.ContainsKey($key)) { Send-Error $Response 400 "unknown font key" $Request; return }
+  if (-not $key -or -not $FontDefs.ContainsKey($key)) { Send-Error $Response 400 "unknown font key" $Request; return }
 
   if ($Script:FontCache.ContainsKey($key)) {
     $data = $Script:FontCache[$key]
@@ -418,9 +423,33 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
     }
     [System.IO.File]::WriteAllBytes($tmpPath, $data)
     # 一時ファイル書き込み+アトミックな置き換え -- 書き込み中のクラッシュや
-    # ディスクフルでPDFが壊れた状態のまま残らないようにするため。
-    [System.IO.File]::Delete($pdfPath)
-    [System.IO.File]::Move($tmpPath, $pdfPath)
+    # ディスクフルでPDFが壊れた状態のまま残らないようにするため。参照実装の
+    # server.pyはos.replace()(Windows上ではReplaceFile/MoveFileExによる
+    # 真にアトミックな置換)を使っているが、.NET Framework(Windows
+    # PowerShell 5.1)にはos.replace()に相当する単一APIがない --
+    # [System.IO.File]::Move()は既存の宛先があると例外を投げるだけで
+    # 置き換えてくれず、Delete()してからMove()すると、その間に例外
+    # (AVによる一時ファイルのロック、権限エラー等)が起きた場合に
+    # オリジナルもコピーもどちらも存在しない状態になり得る(削除だけ
+    # 成功してMoveが失敗するケース)。File.Replace()は宛先が既存の場合に
+    # 限りReplaceFile Win32 APIで真にアトミックに置き換えるので、宛先の
+    # 有無で使い分けて常にアトミックな置換になるようにする。
+    if ([System.IO.File]::Exists($pdfPath)) {
+      # 注意: ここで$nullをそのまま渡すと"パスの形式が無効です"で例外になる --
+      # PowerShellがこの[string]引数へのバインド時に$nullを空文字列へ変換
+      # してしまい、File.Replace()は(真のnullなら「バックアップ不要」と
+      # 解釈するのに)空文字列だと不正なパスとして拒否するため。実機で
+      # 再現・特定済み。[NullString]::Valueを使うとPowerShellの$null→
+      # 空文字列変換を回避して真のnullを渡せる。
+      [System.IO.File]::Replace($tmpPath, $pdfPath, [NullString]::Value)
+    } else {
+      # ダウンロードボタンが同じフォルダへ保存する"_編集済み"派生パスは、
+      # 初回保存時点ではまだ存在しない -- その場合はFile.Replace()が
+      # 使えない(宛先の存在を要求する)ので、単純なMove()にフォール
+      # バックする(宛先が存在しない場合、Move()自体が同一ボリューム内
+      # では単一のリネーム操作としてアトミック)。
+      [System.IO.File]::Move($tmpPath, $pdfPath)
+    }
   } catch {
     Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
     Send-Error $Response 500 $_.Exception.Message $Request
@@ -476,10 +505,26 @@ $prefix = "http://127.0.0.1:$Port/"
 $listener.Prefixes.Add($prefix)
 try {
   $listener.Start()
+} catch [System.Net.HttpListenerException] {
+  # ErrorCode 183 (ERROR_ALREADY_EXISTS) = 既に別プロセスが同じURLプレフィックス
+  # を登録済み -- 以前の「送る」起動が生きているということなので、Python版の
+  # ReusableTCPServer(WinError 10048チェック)と同じ考え方で、この「想定内の
+  # 1パターンだけ」を静かに終了させる。実機で`$_.Exception.ErrorCode`を
+  # 確認して183であることを検証済み(Python版のWSAEADDRINUSE=10048とは
+  # 別の値 -- HttpListenerはソケットではなくHTTP.SYS経由のため)。
+  if ($_.Exception.ErrorCode -eq 183) {
+    exit 0
+  }
+  # それ以外は本当に想定外の失敗(URL ACL不足、無効なプレフィックス等) --
+  # server.pyが「この1パターン以外は再送出して見えるダイアログを出す」の
+  # と同じ理由で、静かに諦めず利用者に伝える。
+  $shell = New-Object -ComObject WScript.Shell
+  $shell.Popup("橋渡しサーバーの起動に失敗しました。`n`n" + $_.Exception.Message, 0, "PDF Editor Tool", 16) | Out-Null
+  exit 1
 } catch {
-  # 既に別プロセスが同じポートを使っている -- 以前の「送る」起動が生きている
-  # ということなので、Python版のReusableTCPServerと同じく静かに終了する。
-  exit 0
+  $shell = New-Object -ComObject WScript.Shell
+  $shell.Popup("橋渡しサーバーの起動に失敗しました。`n`n" + $_.Exception.Message, 0, "PDF Editor Tool", 16) | Out-Null
+  exit 1
 }
 
 try {

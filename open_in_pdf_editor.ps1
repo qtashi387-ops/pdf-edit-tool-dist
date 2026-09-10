@@ -7,10 +7,18 @@
 # 短命な一時トークンファイル経由で渡し(日本語パスをURLエンコードせずに
 # 済ませるため)、既定のブラウザでツールを開く。
 #
-# このファイル自身は自己更新ロジックを持たない -- それは別ファイルの
-# update_checker.ps1の役割(タスクスケジューラ等から独立して定期実行され、
-# このファイルとbridge_server.ps1をまとめて更新する想定)。理由は
-# open_in_pdf_editor.vbs時代からの経緯を参照(セッションメモリ)。
+# このファイル自身が自分自身(open_in_pdf_editor.ps1)とbridge_server.ps1を
+# 更新するロジックは持たない -- それは別ファイルのupdate_checker.ps1の役割
+# (スタートアップフォルダから独立して定期実行され、この2ファイルをまとめて
+# 更新する想定)。理由はopen_in_pdf_editor.vbs時代からの経緯を参照
+# (セッションメモリ)。
+#
+# 一方、index.html(アプリ本体)と利用マニュアルの自動更新チェックは、
+# open_in_pdf_editor.vbs時代からずっとこの起動スクリプト自身が「送る」の
+# たびに行ってきた実績のある仕組みで、この2ファイルは(update_checker.ps1と
+# 違って)このファイル自身を書き換えるわけではないため自己更新ブロックの
+# 対象外 -- そのままこのファイルに移植し、以前と同じタイミング(サーバー
+# 起動より前、PDFが選択されているかのチェックより前)で毎回実行する。
 #
 # Windows 11の「プログラムを選択して開く」ダイアログはコマンド対象が
 # powershell.exe/wscript.exe等の汎用スクリプトホストだと一覧から除外して
@@ -29,12 +37,118 @@ $ErrorActionPreference = "Stop"
 $ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerScript = Join-Path $ToolDir "bridge_server.ps1"
 $Port = 8743
+$DistHost = "https://pdf-edit-tool-dist.haruno.workers.dev"
 
 function Show-Message([string]$Message) {
   $shell = New-Object -ComObject WScript.Shell
   # 第2引数0 = タイムアウトなし(ユーザーが閉じるまで待つ)、48 = vbExclamation
   $shell.Popup($Message, 0, "PDF Editor Tool", 48) | Out-Null
 }
+
+function Show-InfoToast([string]$Message) {
+  $shell = New-Object -ComObject WScript.Shell
+  # 第2引数4 = 4秒で自動的に閉じる(無人/バックグラウンド実行でも
+  # クリック待ちで固まらないように)、64 = vbInformation
+  $shell.Popup($Message, 4, "PDF Editor Tool", 64) | Out-Null
+}
+
+function Test-VersionString([string]$Value) {
+  if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+  $parts = $Value -split '\.'
+  if ($parts.Count -ne 3) { return $false }
+  foreach ($p in $parts) {
+    if ($p -notmatch '^\d+$' -or $p.Length -gt 9) { return $false }
+  }
+  return $true
+}
+
+# 1ならa>b、-1ならa<b、0なら等しい。両方Test-VersionStringを通過済みの前提。
+function Compare-Versions([string]$A, [string]$B) {
+  $pa = $A -split '\.'
+  $pb = $B -split '\.'
+  for ($i = 0; $i -lt 3; $i++) {
+    $na = [int64]$pa[$i]
+    $nb = [int64]$pb[$i]
+    if ($na -gt $nb) { return 1 }
+    if ($na -lt $nb) { return -1 }
+  }
+  return 0
+}
+
+# index.html/利用マニュアルの自動更新チェック本体(vbs版のTryAutoUpdate/
+# TryUpdateManualに相当)。何が失敗しても(オフライン、配信元が落ちている、
+# 壊れたデータ等)静かに諦めてローカルの既存コピーで起動を続行する --
+# 「送る」の実行がこのチェックのせいで止まったり見えるエラーを出したり
+# することは絶対にない。
+function Update-DistFile {
+  param(
+    [string]$VersionUrl,
+    [string]$FileUrl,
+    [string]$VersionFileName,
+    [string]$TargetFileName,
+    [int]$MinBytes,
+    [string]$AppliedMessagePrefix
+  )
+  try {
+    $versionFile = Join-Path $ToolDir $VersionFileName
+    $targetPath  = Join-Path $ToolDir $TargetFileName
+    $newPath     = "$targetPath.new"
+    $bakPath     = "$targetPath.bak"
+
+    $localVersion = "0.0.0"
+    if ([System.IO.File]::Exists($versionFile)) {
+      $v = [System.IO.File]::ReadAllText($versionFile, [System.Text.Encoding]::UTF8).Trim()
+      if (Test-VersionString $v) { $localVersion = $v }
+    }
+
+    $wc = New-Object System.Net.WebClient
+    $wc.Encoding = [System.Text.Encoding]::UTF8
+    $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+    $remoteVersion = $wc.DownloadString($VersionUrl).Trim()
+    if (-not (Test-VersionString $remoteVersion)) { return }
+    if ((Compare-Versions $remoteVersion $localVersion) -le 0) { return }
+
+    $bytes = $wc.DownloadData($FileUrl)
+    if ($bytes.Length -lt $MinBytes) { return }
+
+    [System.IO.File]::WriteAllBytes($newPath, $bytes)
+
+    if ([System.IO.File]::Exists($bakPath)) { [System.IO.File]::Delete($bakPath) }
+    if ([System.IO.File]::Exists($targetPath)) { [System.IO.File]::Move($targetPath, $bakPath) }
+    try {
+      [System.IO.File]::Move($newPath, $targetPath)
+    } catch {
+      if ([System.IO.File]::Exists($bakPath) -and -not [System.IO.File]::Exists($targetPath)) {
+        [System.IO.File]::Move($bakPath, $targetPath)
+      }
+    }
+
+    if (-not [System.IO.File]::Exists($targetPath)) { return }
+
+    [System.IO.File]::WriteAllText($versionFile, $remoteVersion, (New-Object System.Text.UTF8Encoding($false)))
+
+    Show-InfoToast "$AppliedMessagePrefix(v$remoteVersion)"
+  } catch {
+    # オフライン/配信元不達/破損データ等、何が原因でも静かに諦める。
+  }
+}
+
+Update-DistFile `
+  -VersionUrl "$DistHost/version.txt" `
+  -FileUrl "$DistHost/index.html" `
+  -VersionFileName "version.txt" `
+  -TargetFileName "index.html" `
+  -MinBytes 1000000 `
+  -AppliedMessagePrefix "PDF編集ツールを更新しました"
+
+Update-DistFile `
+  -VersionUrl "$DistHost/manual_version.txt" `
+  -FileUrl "$DistHost/PDF%E7%B7%A8%E9%9B%86%E3%83%84%E3%83%BC%E3%83%AB_%E5%88%A9%E7%94%A8%E3%83%9E%E3%83%8B%E3%83%A5%E3%82%A2%E3%83%AB.docx" `
+  -VersionFileName "manual_version.txt" `
+  -TargetFileName "PDF編集ツール_利用マニュアル.docx" `
+  -MinBytes 10000 `
+  -AppliedMessagePrefix "利用マニュアルを更新しました"
 
 if (-not $PdfPath) {
   Show-Message "ファイル(PDF)を右クリックし、送るから実行してください."
