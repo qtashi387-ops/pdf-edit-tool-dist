@@ -13,12 +13,13 @@
 # 更新する想定)。理由はopen_in_pdf_editor.vbs時代からの経緯を参照
 # (セッションメモリ)。
 #
-# 一方、index.html(アプリ本体)と利用マニュアルの自動更新チェックは、
-# open_in_pdf_editor.vbs時代からずっとこの起動スクリプト自身が「送る」の
-# たびに行ってきた実績のある仕組みで、この2ファイルは(update_checker.ps1と
-# 違って)このファイル自身を書き換えるわけではないため自己更新ブロックの
-# 対象外 -- そのままこのファイルに移植し、以前と同じタイミング(サーバー
-# 起動より前、PDFが選択されているかのチェックより前)で毎回実行する。
+# 一方、index.html(アプリ本体)・利用マニュアル・ocr-data.bin(2026-09-11
+# 追加)の自動更新チェックは、open_in_pdf_editor.vbs時代からずっとこの
+# 起動スクリプト自身が「送る」のたびに行ってきた実績のある仕組みで、この
+# 3ファイルは(update_checker.ps1が対象とするファイル群と違って)このファイル
+# 自身を書き換えるわけではないため自己更新ブロックの対象外 -- そのまま
+# このファイルに移植し、以前と同じタイミング(サーバー起動より前、PDFが
+# 選択されているかのチェックより前)で毎回実行する。
 #
 # Windows 11の「プログラムを選択して開く」ダイアログはコマンド対象が
 # powershell.exe/wscript.exe等の汎用スクリプトホストだと一覧から除外して
@@ -36,6 +37,9 @@ $ErrorActionPreference = "Stop"
 
 $ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerScript = Join-Path $ToolDir "bridge_server.ps1"
+# 変更する場合はbridge_server.ps1のparam既定値も必ず同じ値に変更すること
+# (このスクリプトが-Portで明示的に渡すので通常は既定値は使われないが、
+# 2箇所の値がずれると起動待ちが必ずタイムアウトする)。
 $Port = 8743
 $DistHost = "https://pdf-edit-tool-dist.haruno.workers.dev"
 
@@ -149,6 +153,18 @@ Update-DistFile `
   -TargetFileName "PDF編集ツール_利用マニュアル.docx" `
   -MinBytes 10000 `
   -AppliedMessagePrefix "利用マニュアルを更新しました"
+
+# ocr-data.bin(index.htmlが実行時に読み込む、index.html本体とは別出しの
+# ~9MB OCR用データファイル)もindex.htmlと同じタイミング・同じ仕組みで
+# 自動更新する -- こちらもこのファイル自身を書き換えるわけではないため
+# 自己更新ブロックの対象外。
+Update-DistFile `
+  -VersionUrl "$DistHost/ocr_data_version.txt" `
+  -FileUrl "$DistHost/ocr-data.bin" `
+  -VersionFileName "ocr_data_version.txt" `
+  -TargetFileName "ocr-data.bin" `
+  -MinBytes 5000000 `
+  -AppliedMessagePrefix "OCR用データを更新しました"
 
 if (-not $PdfPath) {
   Show-Message "ファイル(PDF)を右クリックし、送るから実行してください."
