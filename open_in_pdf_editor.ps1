@@ -106,15 +106,19 @@ function Update-DistFile {
     }
 
     $wc = New-Object System.Net.WebClient
+    # WebClient.Encodingの既定はOSのANSIコードページ(この日本語ロケール機では
+    # Shift-JIS)であってUTF-8ではない -- 明示しないと、将来配信元の内容が
+    # ASCII以外を含んだ場合に静かに文字化けする(このセッションで実際に
+    # 踏んだBOM/エンコーディングの罠と同じ種類の問題)。
     $wc.Encoding = [System.Text.Encoding]::UTF8
     $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
     $remoteVersion = $wc.DownloadString($VersionUrl).Trim()
-    if (-not (Test-VersionString $remoteVersion)) { return }
-    if ((Compare-Versions $remoteVersion $localVersion) -le 0) { return }
+    if (-not (Test-VersionString $remoteVersion)) { return $false }
+    if ((Compare-Versions $remoteVersion $localVersion) -le 0) { return $false }
 
     $bytes = $wc.DownloadData($FileUrl)
-    if ($bytes.Length -lt $MinBytes) { return }
+    if ($bytes.Length -lt $MinBytes) { return $false }
 
     [System.IO.File]::WriteAllBytes($newPath, $bytes)
 
@@ -128,17 +132,22 @@ function Update-DistFile {
       }
     }
 
-    if (-not [System.IO.File]::Exists($targetPath)) { return }
+    if (-not [System.IO.File]::Exists($targetPath)) { return $false }
 
     [System.IO.File]::WriteAllText($versionFile, $remoteVersion, (New-Object System.Text.UTF8Encoding($false)))
 
     Show-InfoToast "$AppliedMessagePrefix(v$remoteVersion)"
+    return $true
   } catch {
     # オフライン/配信元不達/破損データ等、何が原因でも静かに諦める。
+    return $false
   }
 }
 
-Update-DistFile `
+# $null = ... -- Update-DistFileがbool(適用した/しなかった)を返すようになった
+# ため、戻り値を受けずに呼ぶとパイプライン/stdoutにそのまま"True"/"False"が
+# 出てしまう(update_checker.ps1で実際に踏んだのと同じ罠)。
+$null = Update-DistFile `
   -VersionUrl "$DistHost/version.txt" `
   -FileUrl "$DistHost/index.html" `
   -VersionFileName "version.txt" `
@@ -146,25 +155,13 @@ Update-DistFile `
   -MinBytes 1000000 `
   -AppliedMessagePrefix "PDF編集ツールを更新しました"
 
-Update-DistFile `
+$null = Update-DistFile `
   -VersionUrl "$DistHost/manual_version.txt" `
   -FileUrl "$DistHost/PDF%E7%B7%A8%E9%9B%86%E3%83%84%E3%83%BC%E3%83%AB_%E5%88%A9%E7%94%A8%E3%83%9E%E3%83%8B%E3%83%A5%E3%82%A2%E3%83%AB.docx" `
   -VersionFileName "manual_version.txt" `
   -TargetFileName "PDF編集ツール_利用マニュアル.docx" `
   -MinBytes 10000 `
   -AppliedMessagePrefix "利用マニュアルを更新しました"
-
-# ocr-data.bin(index.htmlが実行時に読み込む、index.html本体とは別出しの
-# ~9MB OCR用データファイル)もindex.htmlと同じタイミング・同じ仕組みで
-# 自動更新する -- こちらもこのファイル自身を書き換えるわけではないため
-# 自己更新ブロックの対象外。
-Update-DistFile `
-  -VersionUrl "$DistHost/ocr_data_version.txt" `
-  -FileUrl "$DistHost/ocr-data.bin" `
-  -VersionFileName "ocr_data_version.txt" `
-  -TargetFileName "ocr-data.bin" `
-  -MinBytes 5000000 `
-  -AppliedMessagePrefix "OCR用データを更新しました"
 
 if (-not $PdfPath) {
   Show-Message "ファイル(PDF)を右クリックし、送るから実行してください."
@@ -225,6 +222,23 @@ function Wait-ForServerReady([int]$Port, [int]$MaxWaitMs) {
   }
   return $false
 }
+
+# ocr-data.bin(index.htmlが実行時に読み込む、index.html本体とは別出しの
+# ~9MB OCR用データファイル)もindex.htmlと同じ仕組みで自動更新する --
+# こちらもこのファイル自身を書き換えるわけではないため自己更新ブロックの
+# 対象外。OCRはクリックされたときだけ必要なファイルなので、index.html/
+# 利用マニュアルのチェックと違って「送る」の応答性を優先し、あえて
+# Start-Process(非同期)の直後・Wait-ForServerReadyのポーリングループの
+# 直前に置く -- このチェックのネットワーク待ち時間がサーバー自身の起動
+# 待ち時間と重なり、素朴に直列実行するより「送る」全体の体感速度が
+# 落ちない。
+$null = Update-DistFile `
+  -VersionUrl "$DistHost/ocr_data_version.txt" `
+  -FileUrl "$DistHost/ocr-data.bin" `
+  -VersionFileName "ocr_data_version.txt" `
+  -TargetFileName "ocr-data.bin" `
+  -MinBytes 5000000 `
+  -AppliedMessagePrefix "OCR用データを更新しました"
 
 if (-not (Wait-ForServerReady $Port 20000)) {
   Show-Message "サーバーが応答しません。少し時間をおいて、もう一度「送る」から開き直してください。"
