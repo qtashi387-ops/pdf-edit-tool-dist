@@ -13,19 +13,28 @@
 # update_checker.ps1が自動配布する。
 #
 # 127.0.0.1のみでリッスン(ネットワークからは到達不可)。index.htmlを通常の
-# 静的ファイルとして配信するほか、3つの追加エンドポイントを持つ:
+# 静的ファイルとして配信するほか、5つの追加エンドポイントを持つ:
 #
-#   GET  /__load  ローカルで選択されたPDFのバイト列をJSONでページへ渡す
-#                (file://ページはブラウザの制約で任意のローカルファイルを
-#                読めないため)
-#   POST /__save  編集後のPDFバイト列を同じパスへ書き戻す。あるパスへの
-#                最初の保存時のみ、編集前のオリジナルの一度きりの
-#                "<name>.bak"バックアップを作る(既に存在する場合は作らない)
-#   GET  /__font  Windowsライセンスのシステムフォント(MSゴシック/明朝、
-#                游ゴシック等)を1書体分抽出してJSONで返す。許可された
-#                キーのみ受け付ける(下記FontDefs参照)。フォントファイル
-#                自体はこのツールに同梱・再配布されず、その場でこのPCから
-#                読み取るのみ。
+#   GET  /__load    ローカルで選択されたPDFのバイト列をJSONでページへ渡す
+#                  (file://ページはブラウザの制約で任意のローカルファイルを
+#                  読めないため)
+#   POST /__save    編集後のPDFバイト列を同じパスへ書き戻す。あるパスへの
+#                  最初の保存時のみ、編集前のオリジナルの一度きりの
+#                  "<name>.bak"バックアップを作る(既に存在する場合は作らない)
+#   GET  /__font    Windowsライセンスのシステムフォント(MSゴシック/明朝、
+#                  游ゴシック等)を1書体分抽出してJSONで返す。許可された
+#                  キーのみ受け付ける(下記FontDefs参照)。フォントファイル
+#                  自体はこのツールに同梱・再配布されず、その場でこのPCから
+#                  読み取るのみ。
+#   POST /__decrypt 送られてきたPDFバイト列の暗号化を、指定パスワード
+#                  (空文字列も可 -- オーナーパスワードのみのPDF向け)で
+#                  解除して返す。同梱のqpdf.exe(Apache-2.0、qpdf\配下)を
+#                  一時ファイル経由で呼び出すだけで、ファイルパスは一切
+#                  受け取らない -- index.html側が既に読み込んでいるPDFの
+#                  バイト列に対してのみ動作する。
+#   POST /__encrypt 送られてきたPDFバイト列に、指定パスワード(1つ、
+#                  ユーザー/オーナー両方に同じ値を使う)で256bit AES暗号化を
+#                  かけて返す。同じくqpdf.exe経由。
 #
 # 実際のファイルパスは/__loadのURLには一切含めない。open_in_pdf_editor.vbsが
 # 短命な一時ファイルにパスを書き込み、URLにはランダムな数値トークンのみを
@@ -71,6 +80,12 @@ $FontDefs = @{
 
 $WindowsFontsDir = Join-Path $env:WINDIR "Fonts"
 $FontsRegKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+
+# 同梱のqpdf.exe(Apache-2.0ライセンス、qpdf\配下にqpdf30.dll等の依存DLLと
+# 一緒に配置 -- VC++再頒布可能パッケージのインストールを前提にしないため)。
+# バージョン更新は自動配布の対象外(index.html等と違い頻繁に変わるもの
+# ではないため) -- 更新する場合は配布用ZIPの作り直しで対応する。
+$QpdfExe = Join-Path $ToolDir "qpdf\qpdf.exe"
 
 # ----------------------------------------------------------------------
 # ビッグエンディアン読み取りヘルパー -- SFNT/TTCフォーマットは全てビッグ
@@ -472,6 +487,121 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
   Send-JsonResponse $Response 200 @{ ok = $true } $Request
 }
 
+# Windows PowerShell 5.1(.NET Framework)ではProcessStartInfo.ArgumentList
+# プロパティがそもそも初期化されておらず$nullのまま(.NET Core/5+でのみ
+# 自動初期化される)-- .Add()を呼ぶと「null値の式ではメソッドを呼び出せ
+# ません」で例外になることを実機で確認済み。open_in_pdf_editor.ps1が
+# Start-Process -ArgumentListで既に踏んでいる「配列を渡しても自動では
+# クォートされない」問題と根は同じ(このPowerShellバージョンの.NET
+# Framework側APIの制約)で、対処法も同じ: 単一の文字列として自前で
+# クォートを組み立てる。パスワードに二重引用符やバックスラッシュが
+# 含まれる場合でも壊れないよう、Win32の標準的な引数エスケープ規則
+# (CommandLineToArgvW/.NET実装が前提とする規則)に従う。
+function ConvertTo-QuotedArg([string]$Value) {
+  if ($Value -eq "") { return '""' }
+  # 閉じクォードの直前に来るバックスラッシュの連続、および二重引用符の
+  # 直前に来るバックスラッシュの連続は、それぞれ2倍にしてからエスケープ
+  # する必要がある(標準的なMSVC argvパース規則)。
+  $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+  $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+  return '"' + $escaped + '"'
+}
+
+# qpdf.exeを一時ファイル経由で呼び出す共通ヘルパー。qpdfはstdin/stdoutでの
+# バイト列直接受け渡しに対応していない(--empty以外は実ファイルパスが必要)
+# ため、都度一意な名前の入出力一時ファイルを作り、成功・失敗に関わらず
+# 必ず両方を後始末する(パスワードを含むPDFの中身をディスクに残さない)。
+# $QpdfArgs には入出力ファイルパスを含めないこと -- ここで末尾に追加する。
+# 戻り値: (出力バイト列 または $null, エラーメッセージ または $null, 終了コード)
+function Invoke-QpdfCrypto([byte[]]$InputBytes, [string[]]$QpdfArgs) {
+  $tmpDir = [System.IO.Path]::GetTempPath()
+  $suffix = [guid]::NewGuid().ToString("N")
+  $inPath = Join-Path $tmpDir "pdf_editor_qpdf_in_$suffix.pdf"
+  $outPath = Join-Path $tmpDir "pdf_editor_qpdf_out_$suffix.pdf"
+  try {
+    [System.IO.File]::WriteAllBytes($inPath, $InputBytes)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $QpdfExe
+    $allArgs = $QpdfArgs + @($inPath, $outPath)
+    $psi.Arguments = (($allArgs | ForEach-Object { ConvertTo-QuotedArg $_ }) -join " ")
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    # stdoutは使わないが、読み切らずにWaitForExit()すると出力バッファが
+    # 埋まった場合にqpdf側がブロックし得るため、両方読み切ってから待つ。
+    $null = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    # qpdfの終了コード: 0=成功、3=警告付きだが利用可能な出力あり、
+    # それ以外(1, 2等)は実際のエラー(パスワード不正など)。
+    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3) {
+      return $null, $stderr.Trim(), $proc.ExitCode
+    }
+    if (-not (Test-Path $outPath -PathType Leaf)) {
+      return $null, "qpdf did not produce an output file", $proc.ExitCode
+    }
+    $outBytes = [System.IO.File]::ReadAllBytes($outPath)
+    return $outBytes, $null, $proc.ExitCode
+  } finally {
+    # Remove-Itemではなく[System.IO.File]::Delete()を使う -- 存在しない
+    # パスに対しても例外を投げない(Remove-Itemの-ErrorAction
+    # SilentlyContinueと同じ効果を素直なtry/catchだけで得られる)。
+    try { [System.IO.File]::Delete($inPath) } catch { }
+    try { [System.IO.File]::Delete($outPath) } catch { }
+  }
+}
+
+function Handle-Decrypt([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
+  if (-not (Test-FromThisToolsOwnPage $Request)) { Send-Error $Response 403 "forbidden" $Request; return }
+  if ($Request.ContentLength64 -le 0 -or $Request.ContentLength64 -gt 200MB) { Send-Error $Response 400 "invalid content length" $Request; return }
+
+  $reader = New-Object System.IO.StreamReader($Request.InputStream, [System.Text.Encoding]::UTF8)
+  $bodyText = $reader.ReadToEnd()
+  $reader.Close()
+  try {
+    $body = $bodyText | ConvertFrom-Json
+    $data = [Convert]::FromBase64String($body.data)
+    # $body.passwordが省略された場合、pdf.js側と同じ「オーナーパスワードのみ
+    # (ユーザーパスワードは空文字列)」のケースとして扱う -- 空文字列でも
+    # qpdfの--password=は正しく機能する(実機で確認済み)。
+    $password = if ($null -ne $body.password) { [string]$body.password } else { "" }
+  } catch {
+    Send-Error $Response 400 "malformed request" $Request; return
+  }
+  if (-not (Test-Path $QpdfExe -PathType Leaf)) { Send-Error $Response 500 "qpdf.exe not found" $Request; return }
+
+  $outBytes, $err, $exitCode = Invoke-QpdfCrypto $data @("--password=$password", "--decrypt")
+  if ($exitCode -eq 2 -and $err -match "invalid password") { Send-Error $Response 401 "invalid password" $Request; return }
+  if ($null -eq $outBytes) { Send-Error $Response 500 $err $Request; return }
+  Send-JsonResponse $Response 200 @{ data = [Convert]::ToBase64String($outBytes) } $Request
+}
+
+function Handle-Encrypt([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
+  if (-not (Test-FromThisToolsOwnPage $Request)) { Send-Error $Response 403 "forbidden" $Request; return }
+  if ($Request.ContentLength64 -le 0 -or $Request.ContentLength64 -gt 200MB) { Send-Error $Response 400 "invalid content length" $Request; return }
+
+  $reader = New-Object System.IO.StreamReader($Request.InputStream, [System.Text.Encoding]::UTF8)
+  $bodyText = $reader.ReadToEnd()
+  $reader.Close()
+  try {
+    $body = $bodyText | ConvertFrom-Json
+    $data = [Convert]::FromBase64String($body.data)
+    $password = [string]$body.password
+  } catch {
+    Send-Error $Response 400 "malformed request" $Request; return
+  }
+  if ([string]::IsNullOrEmpty($password)) { Send-Error $Response 400 "password required" $Request; return }
+  if (-not (Test-Path $QpdfExe -PathType Leaf)) { Send-Error $Response 500 "qpdf.exe not found" $Request; return }
+
+  # ユーザー/オーナー両方のパスワードに同じ値を使う(ツール側UIも
+  # パスワード1つだけ入力させる単純な仕様のため)、256bit AES固定。
+  $outBytes, $err, $exitCode = Invoke-QpdfCrypto $data @("--encrypt", $password, $password, "256", "--")
+  if ($null -eq $outBytes) { Send-Error $Response 500 $err $Request; return }
+  Send-JsonResponse $Response 200 @{ data = [Convert]::ToBase64String($outBytes) } $Request
+}
+
 function Handle-StaticFile([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
   $relPath = [Uri]::UnescapeDataString($Request.Url.AbsolutePath.TrimStart('/'))
   if ([string]::IsNullOrEmpty($relPath)) { $relPath = "index.html" }
@@ -559,6 +689,10 @@ try {
         if (-not (Test-FromThisToolsOwnPage $request)) { Send-Error $response 403 "forbidden" $request } else { Handle-Font $request $response }
       } elseif ($request.HttpMethod -eq "POST" -and $path -eq "/__save") {
         Handle-Save $request $response
+      } elseif ($request.HttpMethod -eq "POST" -and $path -eq "/__decrypt") {
+        Handle-Decrypt $request $response
+      } elseif ($request.HttpMethod -eq "POST" -and $path -eq "/__encrypt") {
+        Handle-Encrypt $request $response
       } elseif ($request.HttpMethod -eq "GET" -or $request.HttpMethod -eq "HEAD") {
         # HEADは、open_in_pdf_editor.ps1(旧vbs)がサーバーの起動完了を確認する
         # ためだけに使う -- 本文を丸ごと転送せずに済ませる意図なので、
