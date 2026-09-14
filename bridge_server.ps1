@@ -597,7 +597,17 @@ function Handle-Encrypt([System.Net.HttpListenerRequest]$Request, [System.Net.Ht
 
   # ユーザー/オーナー両方のパスワードに同じ値を使う(ツール側UIも
   # パスワード1つだけ入力させる単純な仕様のため)、256bit AES固定。
-  $outBytes, $err, $exitCode = Invoke-QpdfCrypto $data @("--encrypt", $password, $password, "256", "--")
+  #
+  # --user-password=/--owner-password=/--bits=(qpdf 11.7.0以降、フラグ形式)
+  # を使う -- 従来の位置引数形式(--encrypt user-password owner-password
+  # key-length --)だと、パスワードがハイフンで始まる場合にqpdf自身のCLI
+  # パーサーがそれを新しいオプションの開始と誤認識し、"unrecognized
+  # argument"で失敗する(実機のqpdf.exeで再現確認済み)。ConvertTo-QuotedArg
+  # によるシェル引用符付けは1つの引数として正しく渡すだけで、qpdf自身が
+  # その引数の中身をどう解釈するかまでは変えられないため、Handle-Decrypt
+  # が使っている`--password=$password`と同じ「1トークンに値を埋め込む」
+  # 形式に揃えて回避する。
+  $outBytes, $err, $exitCode = Invoke-QpdfCrypto $data @("--encrypt", "--user-password=$password", "--owner-password=$password", "--bits=256", "--")
   if ($null -eq $outBytes) { Send-Error $Response 500 $err $Request; return }
   Send-JsonResponse $Response 200 @{ data = [Convert]::ToBase64String($outBytes) } $Request
 }
