@@ -529,11 +529,17 @@ function Invoke-QpdfCrypto([byte[]]$InputBytes, [string[]]$QpdfArgs) {
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
-    # stdoutは使わないが、読み切らずにWaitForExit()すると出力バッファが
-    # 埋まった場合にqpdf側がブロックし得るため、両方読み切ってから待つ。
-    $null = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
+    # stdout/stderrは同時に非同期で読み始める(ReadToEndAsync) -- 逐次
+    # (先にstdoutをReadToEnd()で読み切ってからstderrを読む)だと、qpdfが
+    # stdout側のOSパイプバッファが埋まる前にstderr側を埋めてしまった場合、
+    # こちらがstdoutの読み切りを待っている間にqpdf自身がstderrへの書き込みで
+    # ブロックし、双方が相手を待ち続ける古典的なデッドロックになり得る。
+    # 両方を同時に読み進めることでどちらのバッファも埋まらないようにする。
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
     $proc.WaitForExit()
+    $null = $stdoutTask.Result
+    $stderr = $stderrTask.Result
     # qpdfの終了コード: 0=成功、3=警告付きだが利用可能な出力あり、
     # それ以外(1, 2等)は実際のエラー(パスワード不正など)。
     if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3) {
@@ -554,12 +560,18 @@ function Invoke-QpdfCrypto([byte[]]$InputBytes, [string[]]$QpdfArgs) {
 }
 
 function Handle-Decrypt([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
-  if (-not (Test-FromThisToolsOwnPage $Request)) { Send-Error $Response 403 "forbidden" $Request; return }
   if ($Request.ContentLength64 -le 0 -or $Request.ContentLength64 -gt 200MB) { Send-Error $Response 400 "invalid content length" $Request; return }
 
   $reader = New-Object System.IO.StreamReader($Request.InputStream, [System.Text.Encoding]::UTF8)
   $bodyText = $reader.ReadToEnd()
   $reader.Close()
+
+  # Handle-Saveの自分自身のコメント(do_POST/このファイルの441行目付近)と
+  # 同じ理由でボディを読み切ってからここで確認する -- 先に403で弾いて
+  # ボディを読まずに閉じると、送信側がまだ送っている途中でOSがTCP RSTを
+  # 送りかねず、既に書いたはずの403応答自体が消えてしまう場合がある。
+  if (-not (Test-FromThisToolsOwnPage $Request)) { Send-Error $Response 403 "forbidden" $Request; return }
+
   try {
     $body = $bodyText | ConvertFrom-Json
     $data = [Convert]::FromBase64String($body.data)
@@ -579,12 +591,16 @@ function Handle-Decrypt([System.Net.HttpListenerRequest]$Request, [System.Net.Ht
 }
 
 function Handle-Encrypt([System.Net.HttpListenerRequest]$Request, [System.Net.HttpListenerResponse]$Response) {
-  if (-not (Test-FromThisToolsOwnPage $Request)) { Send-Error $Response 403 "forbidden" $Request; return }
   if ($Request.ContentLength64 -le 0 -or $Request.ContentLength64 -gt 200MB) { Send-Error $Response 400 "invalid content length" $Request; return }
 
   $reader = New-Object System.IO.StreamReader($Request.InputStream, [System.Text.Encoding]::UTF8)
   $bodyText = $reader.ReadToEnd()
   $reader.Close()
+
+  # Handle-Decrypt/Handle-Saveと同じ理由(このファイル内の各自のコメント
+  # 参照) -- ボディを読み切ってから認証を確認する。
+  if (-not (Test-FromThisToolsOwnPage $Request)) { Send-Error $Response 403 "forbidden" $Request; return }
+
   try {
     $body = $bodyText | ConvertFrom-Json
     $data = [Convert]::FromBase64String($body.data)
