@@ -64,6 +64,20 @@ $ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # 誤って拒否され得る -- OrdinalIgnoreCaseで構築する。
 $Script:ServedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
+# 編集後のPDFの保存名「<元の名前>_<番号>.pdf」(index.htmlのnextEditedFileName()参照)を許可するための、
+# 「番号を除いた名前」の一覧。/__loadが渡した元ファイルごとに、(1)元の名前そのもの、(2)元の名前の末尾が
+# 「_数字」ならそれを除いたもの(「見積_2.pdf」を開いた場合の「見積_3.pdf」用)の2つを、フォルダ込みの
+# フルパス(拡張子なし)で登録する。保存名は、この一覧のどれかに「_数字.pdf」を付けた形に限る。
+# 番号は保存のたびに増えて数が決まらないので、ServedPathsへ1つずつ登録する方式は使えない。
+# 数字だけを許す形なので、フォルダの区切りや「..」は入り込めず、必ず元ファイルと同じフォルダに保存される。
+$Script:SaveCopyPrefixes = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+function Test-SaveCopyPath([string]$Path) {
+  if ([string]::IsNullOrEmpty($Path)) { return $false }
+  if (-not ($Path -match '^(?<prefix>.+)_\d{1,9}\.pdf$')) { return $false }
+  return $Script:SaveCopyPrefixes.Contains($Matches['prefix'])
+}
+
 # フォントキー -> 既に抽出済みのバイト列。同じシステムフォントで再選択/
 # 再エクスポートするたびに(数MBの)元ファイルを読み直さないためのキャッシュ。
 $Script:FontCache = @{}
@@ -390,7 +404,13 @@ function Handle-Load([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
   # ここで登録するパスが増えるだけ。
   $ext = [System.IO.Path]::GetExtension($pdfPath)
   $base = $pdfPath.Substring(0, $pdfPath.Length - $ext.Length)
-  [void]$Script:ServedPaths.Add($base + "_編集済み" + $ext)
+  [void]$Script:ServedPaths.Add($base + "_編集済み" + $ext) # 旧版のindex.html(保存名が「_編集済み」固定だった頃)のため
+  # 現行のindex.htmlの保存名「<元の名前>_<番号>.pdf」用(Test-SaveCopyPath参照)。JS側のnextEditedFileName()と同じ規則。
+  [void]$Script:SaveCopyPrefixes.Add($base)
+  $leafBase = [System.IO.Path]::GetFileNameWithoutExtension($pdfPath)
+  if ($leafBase -match '^(?<stem>.+)_\d{1,9}$') {
+    [void]$Script:SaveCopyPrefixes.Add($base.Substring(0, $base.Length - ($leafBase.Length - $Matches['stem'].Length)))
+  }
 
   Send-JsonResponse $Response 200 @{
     filename = [System.IO.Path]::GetFileName($pdfPath)
@@ -440,7 +460,7 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
   # 起こすかは未検証だが、念のため同じ順序を踏襲している)。
   if (-not (Test-FromThisToolsOwnPage $Request)) { Send-Error $Response 403 "forbidden" $Request; return }
 
-  if (-not $Script:ServedPaths.Contains($pdfPath)) { Send-Error $Response 403 "unknown path" $Request; return }
+  if (-not (Test-SaveCopyPath $pdfPath) -and -not $Script:ServedPaths.Contains($pdfPath)) { Send-Error $Response 403 "unknown path" $Request; return }
   if (-not $pdfPath.ToLower().EndsWith(".pdf")) { Send-Error $Response 400 "not a pdf path" $Request; return }
 
   $tmpPath = "$pdfPath.tmp-$PID-$([guid]::NewGuid().ToString('N'))"
