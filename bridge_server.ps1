@@ -463,10 +463,28 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
   if (-not (Test-SaveCopyPath $pdfPath) -and -not $Script:ServedPaths.Contains($pdfPath)) { Send-Error $Response 403 "unknown path" $Request; return }
   if (-not $pdfPath.ToLower().EndsWith(".pdf")) { Send-Error $Response 400 "not a pdf path" $Request; return }
 
+  # 番号付きの保存名(<元の名前>_<番号>.pdf。元のパス自身や、旧版の「_編集済み」は含まない)は、既に同じ名前の
+  # ファイルがあっても、置き換えない: 空いている次の番号(同じ桁数)で保存する。番号は、PDFを開いている間だけ
+  # 数えるので、翌日に同じ元ファイルから保存すると、また「_1」になる。ここで置き換えてしまうと、前回の保存や、
+  # ページごとの分割で作った「<名前>_1.pdf」などを、黙って失う(.bakは1回目の置き換えの分しか残らない)。
+  # 実際に保存したパスは、応答のpathで返す(index.html側は、次の番号をその続きから数える)。
+  $neverOverwrite = (Test-SaveCopyPath $pdfPath) -and -not $Script:ServedPaths.Contains($pdfPath)
+  if ($neverOverwrite -and [System.IO.File]::Exists($pdfPath)) {
+    $mNum = [regex]::Match($pdfPath, '^(?<prefix>.+)_(?<n>\d{1,9})\.pdf$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $numWidth = $mNum.Groups['n'].Value.Length
+    $freePath = $null
+    for ([int64]$k = [int64]$mNum.Groups['n'].Value + 1; $k -le 999999999 -and $k -le [int64]$mNum.Groups['n'].Value + 1000; $k++) {
+      $cand = $mNum.Groups['prefix'].Value + "_" + ([string]$k).PadLeft($numWidth, '0') + ".pdf"
+      if (-not [System.IO.File]::Exists($cand)) { $freePath = $cand; break }
+    }
+    if (-not $freePath) { Send-Error $Response 409 "no free number" $Request; return }
+    $pdfPath = $freePath
+  }
+
   $tmpPath = "$pdfPath.tmp-$PID-$([guid]::NewGuid().ToString('N'))"
   try {
     $bakPath = "$pdfPath.bak"
-    if ((Test-Path $pdfPath -PathType Leaf) -and -not (Test-Path $bakPath)) {
+    if (-not $neverOverwrite -and (Test-Path $pdfPath -PathType Leaf) -and -not (Test-Path $bakPath)) {
       Copy-Item -Path $pdfPath -Destination $bakPath -Force
     }
     [System.IO.File]::WriteAllBytes($tmpPath, $data)
@@ -482,7 +500,7 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
     # 成功してMoveが失敗するケース)。File.Replace()は宛先が既存の場合に
     # 限りReplaceFile Win32 APIで真にアトミックに置き換えるので、宛先の
     # 有無で使い分けて常にアトミックな置換になるようにする。
-    if ([System.IO.File]::Exists($pdfPath)) {
+    if (-not $neverOverwrite -and [System.IO.File]::Exists($pdfPath)) {
       # 注意: ここで$nullをそのまま渡すと"パスの形式が無効です"で例外になる --
       # PowerShellがこの[string]引数へのバインド時に$nullを空文字列へ変換
       # してしまい、File.Replace()は(真のnullなら「バックアップ不要」と
@@ -496,6 +514,8 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
       # 使えない(宛先の存在を要求する)ので、単純なMove()にフォール
       # バックする(宛先が存在しない場合、Move()自体が同一ボリューム内
       # では単一のリネーム操作としてアトミック)。
+      # (番号付きの保存名は、必ずここ: 万一、確認の直後に同じ名前のファイルができていたら、Move()が例外になり、
+      # 置き換えずに500で終わる。)
       [System.IO.File]::Move($tmpPath, $pdfPath)
     }
   } catch {
@@ -504,7 +524,7 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
     return
   }
 
-  Send-JsonResponse $Response 200 @{ ok = $true } $Request
+  Send-JsonResponse $Response 200 @{ ok = $true; path = $pdfPath } $Request
 }
 
 # Windows PowerShell 5.1(.NET Framework)ではProcessStartInfo.ArgumentList
