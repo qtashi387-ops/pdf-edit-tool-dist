@@ -20,7 +20,11 @@
 #                  読めないため)
 #   POST /__save    編集後のPDFバイト列を同じパスへ書き戻す。あるパスへの
 #                  最初の保存時のみ、編集前のオリジナルの一度きりの
-#                  "<name>.bak"バックアップを作る(既に存在する場合は作らない)
+#                  "<name>.bak"バックアップを作る(既に存在する場合は作らない)。
+#                  ただし、ボディにbackupCopy:trueがあるとき(index.htmlの
+#                  自動保存。2026-11-17)は、.bakではなく、ふつうのPDFの
+#                  "<元の名前>_元のファイル.pdf"を、まだ無いときだけ作る
+#                  (作れなければ、元のファイルは置き換えずに500を返す)
 #   GET  /__font    Windowsライセンスのシステムフォント(MSゴシック/明朝、
 #                  游ゴシック等)を1書体分抽出してJSONで返す。許可された
 #                  キーのみ受け付ける(下記FontDefs参照)。フォントファイル
@@ -449,6 +453,8 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
     $body = $bodyText | ConvertFrom-Json
     $pdfPath = $body.path
     $data = [Convert]::FromBase64String($body.data)
+    # 自動保存(index.html)が付ける印。元の内容の控え「<元の名前>_元のファイル.pdf」を、まだ無いときだけ作らせる。
+    $wantBackupCopy = ($body.backupCopy -eq $true)
   } catch {
     Send-Error $Response 400 "malformed request" $Request; return
   }
@@ -484,7 +490,24 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
   $tmpPath = "$pdfPath.tmp-$PID-$([guid]::NewGuid().ToString('N'))"
   try {
     $bakPath = "$pdfPath.bak"
-    if (-not $neverOverwrite -and (Test-Path $pdfPath -PathType Leaf) -and -not (Test-Path $bakPath)) {
+    $backupCopyPath = $null
+    $backupCopyCreated = $false
+    if ($wantBackupCopy -and -not $neverOverwrite -and [System.IO.File]::Exists($pdfPath)) {
+      # 自動保存: 元の内容の控え(ふつうのPDF)。同じ名前がすでにあれば、作らない(最初の状態を守る)。一時ファイル経由で
+      # コピーして、最後にMove(既にあれば例外になる=置き換えない)する。控えを作れなかったら、例外のまま外側のcatchへ
+      # 進み、元のファイルは置き換えない(控えの無い上書きはしない)。ここまでのチェックで、$pdfPathは必ず".pdf"で終わる。
+      $backupCopyPath = $pdfPath.Substring(0, $pdfPath.Length - 4) + "_元のファイル.pdf"
+      if (-not [System.IO.File]::Exists($backupCopyPath)) {
+        $backupTmp = "$backupCopyPath.tmp-$PID-$([guid]::NewGuid().ToString('N'))"
+        try {
+          [System.IO.File]::Copy($pdfPath, $backupTmp)
+          [System.IO.File]::Move($backupTmp, $backupCopyPath)
+          $backupCopyCreated = $true
+        } finally {
+          if ([System.IO.File]::Exists($backupTmp)) { Remove-Item -LiteralPath $backupTmp -Force -ErrorAction SilentlyContinue }
+        }
+      }
+    } elseif (-not $neverOverwrite -and (Test-Path $pdfPath -PathType Leaf) -and -not (Test-Path $bakPath)) {
       Copy-Item -Path $pdfPath -Destination $bakPath -Force
     }
     [System.IO.File]::WriteAllBytes($tmpPath, $data)
@@ -524,7 +547,9 @@ function Handle-Save([System.Net.HttpListenerRequest]$Request, [System.Net.HttpL
     return
   }
 
-  Send-JsonResponse $Response 200 @{ ok = $true; path = $pdfPath } $Request
+  $result = @{ ok = $true; path = $pdfPath }
+  if ($wantBackupCopy) { $result.backup = $backupCopyPath; $result.backupCreated = $backupCopyCreated } # 自動保存への知らせ(この応答を見て、控えを作った旨を通知する)
+  Send-JsonResponse $Response 200 $result $Request
 }
 
 # Windows PowerShell 5.1(.NET Framework)ではProcessStartInfo.ArgumentList
