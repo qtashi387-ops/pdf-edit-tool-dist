@@ -720,18 +720,45 @@ function Handle-StaticFile([System.Net.HttpListenerRequest]$Request, [System.Net
     ".ico"  { "image/x-icon" }
     default { "application/octet-stream" }
   }
-  $bytes = [System.IO.File]::ReadAllBytes($resolvedFull)
+  # ブラウザのキャッシュ対応(v1.0.9): ファイルの更新日時+大きさから目印(ETag)を作り、
+  # 「Cache-Control: no-cache」(=使う前に必ず確認する)と一緒に返す。ブラウザは次回、
+  # 目印を添えて問い合わせ(If-None-Match)、変わっていなければ本文なしの304で済む。
+  # 約15MBのindex.htmlを、起動のたびに受け取り直す約1.1秒が不要になる。ファイルが
+  # 入れ替わる(自動更新)と目印が変わるので、新しい版は必ず取り直される(古い版が
+  # 使われ続けることはない)。
+  # 目印は、本文を読む「前」に作る: 逆(読んだ後に作る)だと、読んだ直後にファイルが
+  # 入れ替わったとき、古い本文に新しい目印が付き、次回から古い本文が使われ続ける。
+  $fileInfo = New-Object System.IO.FileInfo($resolvedFull)
+  $etag = '"' + $fileInfo.LastWriteTimeUtc.Ticks.ToString("x") + "-" + $fileInfo.Length.ToString("x") + '"'
+  $Response.AddHeader("ETag", $etag)
+  $Response.AddHeader("Cache-Control", "no-cache")
+  $clientTags = $Request.Headers["If-None-Match"]
+  if ($clientTags) {
+    foreach ($tag in ($clientTags -split ",")) {
+      $tag = $tag.Trim()
+      if ($tag.StartsWith("W/")) { $tag = $tag.Substring(2) }
+      if ($tag -eq "*" -or $tag -eq $etag) {
+        $Response.StatusCode = 304
+        $Response.OutputStream.Close()
+        return
+      }
+    }
+  }
   $Response.StatusCode = 200
   $Response.ContentType = $contentType
-  $Response.ContentLength64 = $bytes.Length
   # HEADはヘッダーのみを返す(本文を書かない) -- HttpListenerResponseは
   # リクエストメソッドを見て自動で本文を抑制したりはしないため、ここで
   # 明示的に分岐する必要がある。抑制しないと、HEADで問い合わせたクライアント
   # (open_in_pdf_editor.ps1の起動待ちポーリング等)が応答をハングしたように
-  # 誤認する。
-  if ($Request.HttpMethod -ne "HEAD") {
-    $Response.OutputStream.Write($bytes, 0, $bytes.Length)
+  # 誤認する。HEADは約15MBの本文を読む必要が無いので、大きさだけ伝える。
+  if ($Request.HttpMethod -eq "HEAD") {
+    $Response.ContentLength64 = $fileInfo.Length
+    $Response.OutputStream.Close()
+    return
   }
+  $bytes = [System.IO.File]::ReadAllBytes($resolvedFull)
+  $Response.ContentLength64 = $bytes.Length
+  $Response.OutputStream.Write($bytes, 0, $bytes.Length)
   $Response.OutputStream.Close()
 }
 
