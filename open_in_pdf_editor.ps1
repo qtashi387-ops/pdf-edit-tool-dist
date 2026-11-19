@@ -21,13 +21,14 @@
 # このファイルに移植し、以前と同じタイミング(サーバー起動より前、PDFが
 # 選択されているかのチェックより前)で実行する。
 #
-# launcher v1.0.4(2026-11-18、起動を速くした):
-#  (1) 更新確認は、直近10分以内に成功していれば3つとも省略する。行うときは、3つの
-#      版ファイルを同時に取りに行き(以前は1つずつ順番)、最長8秒で打ち切る。
+# launcher v1.0.5(2026-11-19、起動を速くした。1.0.4の作り直し):
+#  (1) 更新確認は、直近10分以内に成功していれば3つとも省略する。
 #  (2) ブラウザで開くURLを「index.html#open=番号」にした(画面側がv1.43.2から対応)。
 #      「?open=番号」は番号が毎回変わり、ブラウザのキャッシュが効かなかった。
 #      ブリッジ(v1.0.9)が目印(ETag)を付けるので、2回目以降は約15MBの画面本体を
 #      取り直さずに済む。
+#  (1.0.4にあった、版ファイルの同時取得は、入れていない: 1.0.4のファイルが、このPCの
+#  セキュリティ機能に危険と判断されて削除されたため。tests/README.mdの「5q」参照。)
 #
 # Windows 11の「プログラムを選択して開く」ダイアログはコマンド対象が
 # powershell.exe/wscript.exe等の汎用スクリプトホストだと一覧から除外して
@@ -51,19 +52,14 @@ $ServerScript = Join-Path $ToolDir "bridge_server.ps1"
 $Port = 8743
 $DistHost = "https://pdf-edit-tool-dist.haruno.workers.dev"
 
-# --- 起動を速くするための設定(launcher v1.0.4) ---
 # 更新確認(index.html・利用マニュアル・OCR用データの3つ)の頻度制限: 直近にこの分数以内に
-# 確認に成功していれば、3つともまるごと省略する(確認は毎回約0.3〜0.8秒かかる)。
+# 確認に成功していれば、3つともまるごと省略する(確認は毎回約1秒かかる)。
 # 代償: 新しい版が出てから手元に届くまで、最長でこの分数だけ遅れうる。
 $UpdateCheckIntervalMinutes = 10
 $UpdateCheckStampFile = Join-Path $ToolDir "update_check_stamp.txt"
-# 3つの版ファイル(数十バイト)の確認を、同時に待つ最大ミリ秒。これを超えたら、今回は更新せず
-# 手元の版のまま起動する(次回また確認する)。以前は時間の制限が無く、通信が詰まると、
-# WebClientの既定(100秒)まで1つずつ待ち続けた。
-$VersionCheckTimeoutMs = 8000
 # 「index.html#open=番号」でブラウザを開いてよい、アプリ(index.html)の最低バージョン。
-# #open=を読めるのは画面側がv1.43.2から。手元のindex.htmlがこれより古い(更新できず
-# 古いまま起動する)ときは、従来の「?open=番号」で開く。
+# #open=を読めるのは画面側がv1.43.2から。手元のindex.htmlがこれより古いときは、
+# 従来の「?open=番号」で開く。
 $HashOpenMinAppVersion = "1.43.2"
 
 function Show-Message([string]$Message) {
@@ -102,7 +98,7 @@ function Compare-Versions([string]$A, [string]$B) {
   return 0
 }
 
-# --- 更新確認の頻度制限(launcher v1.0.4) ---
+# --- 更新確認の頻度制限(launcher v1.0.5) ---
 # 直近に更新確認に成功した時刻を、ツールフォルダの小さなファイルに残す。
 # 返り値: 今回、更新確認を行うべきならtrue。ファイルが無い・読めない・壊れている・
 # 間隔(分)を過ぎている・時計が戻って未来の時刻になっている、のどれでもtrue
@@ -128,52 +124,6 @@ function Write-UpdateCheckStamp([string]$StampFile) {
   }
 }
 
-# --- 版ファイルの確認を同時に行う(launcher v1.0.4) ---
-# 以前は、3つの版ファイル(version.txt・manual_version.txt・ocr_data_version.txt)を
-# 1つずつ順番に取りに行っていた。同時に取りに行き、3回分の往復を1回分にまとめる。
-# WebClientは1つで同時に1通信しかできないので、1通信につき1つ作る。
-function Start-VersionFetch([string]$Url) {
-  try {
-    # 同じ相手への同時接続数の既定は2本まで(3つ目が待たされ、同時にならない)。引き上げる
-    # (このプロセスだけの設定。接続先ごとの上限は最初の通信のときに決まるので、
-    # 最初の通信より前に行う)。
-    if ([System.Net.ServicePointManager]::DefaultConnectionLimit -lt 8) { [System.Net.ServicePointManager]::DefaultConnectionLimit = 8 }
-    $wc = New-Object System.Net.WebClient
-    # UTF-8の指定とUser-Agentの理由は、Update-DistFileの同じ箇所のコメントを参照。
-    $wc.Encoding = [System.Text.Encoding]::UTF8
-    $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-    return @{ Client = $wc; Task = $wc.DownloadStringTaskAsync($Url) }
-  } catch {
-    return $null
-  }
-}
-
-# 全部の取得が終わるまで(または、全体で$TimeoutMsを過ぎるまで)待つ。
-# 失敗した取得があっても例外にはしない(結果はGet-FetchedVersionで見る)。
-function Wait-VersionFetches([object[]]$Fetches, [int]$TimeoutMs) {
-  $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
-  foreach ($f in $Fetches) {
-    if ($null -eq $f) { continue }
-    $remainingMs = [int][Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    try { $null = $f.Task.Wait($remainingMs) } catch { }
-  }
-}
-
-# 取得できた版の文字列(前後の空白を除いたもの)。取得が失敗・時間切れなら$null
-# (時間切れの通信は取り消す)。
-function Get-FetchedVersion($Fetch) {
-  if ($null -eq $Fetch) { return $null }
-  try {
-    if ($Fetch.Task.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) {
-      try { $Fetch.Client.CancelAsync() } catch { }
-      return $null
-    }
-    return ([string]$Fetch.Task.Result).Trim()
-  } catch {
-    return $null
-  }
-}
-
 # ブラウザで開くURL。画面側(index.html)が「#open=番号」を読めるバージョン以上なら、
 # 「#open=番号」(URLの#以降は、ブラウザのキャッシュの照合に使われない=毎回同じURLとして
 # 約15MBの画面本体をキャッシュから使える)。古いままなら従来の「?open=番号」
@@ -189,14 +139,11 @@ function Get-BrowserUrl([int]$Port, $Token, [string]$LocalAppVersion, [string]$H
 # 壊れたデータ等)静かに諦めてローカルの既存コピーで起動を続行する --
 # 「送る」の実行がこのチェックのせいで止まったり見えるエラーを出したり
 # することは絶対にない。
-#
-# 配信元の版($RemoteVersionText)は、呼び出し側が先に同時に取得したものを受け取る
-# (Start-VersionFetch/Get-FetchedVersion)。取得できなかった場合は$nullを渡す。
 # 返り値(文字列): "applied"=新しい版を適用した / "current"=確認できて、すでに最新 /
 # "failed"=確認または適用に失敗した(今回は更新できていない)。
 function Update-DistFile {
   param(
-    [string]$RemoteVersionText,
+    [string]$VersionUrl,
     [string]$FileUrl,
     [string]$VersionFileName,
     [string]$TargetFileName,
@@ -215,10 +162,6 @@ function Update-DistFile {
       if (Test-VersionString $v) { $localVersion = $v }
     }
 
-    $remoteVersion = "$RemoteVersionText".Trim()
-    if (-not (Test-VersionString $remoteVersion)) { return "failed" }
-    if ((Compare-Versions $remoteVersion $localVersion) -le 0) { return "current" }
-
     $wc = New-Object System.Net.WebClient
     # WebClient.Encodingの既定はOSのANSIコードページ(この日本語ロケール機では
     # Shift-JIS)であってUTF-8ではない -- 明示しないと、将来配信元の内容が
@@ -226,6 +169,10 @@ function Update-DistFile {
     # 踏んだBOM/エンコーディングの罠と同じ種類の問題)。
     $wc.Encoding = [System.Text.Encoding]::UTF8
     $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+    $remoteVersion = $wc.DownloadString($VersionUrl).Trim()
+    if (-not (Test-VersionString $remoteVersion)) { return "failed" }
+    if ((Compare-Versions $remoteVersion $localVersion) -le 0) { return "current" }
 
     $bytes = $wc.DownloadData($FileUrl)
     if ($bytes.Length -lt $MinBytes) { return "failed" }
@@ -256,21 +203,13 @@ function Update-DistFile {
 
 # 今回、更新確認を行うか(直近$UpdateCheckIntervalMinutes分以内に成功していれば省略)。
 # 3つの確認(index.html・利用マニュアル・OCR用データ)は、まとめて行う・まとめて省略する。
+# 戻り値は必ず変数で受ける(受けないと、パイプライン/stdoutに文字列がそのまま出る --
+# update_checker.ps1で実際に踏んだ罠)。
 $updateDue = Test-UpdateCheckDue $UpdateCheckStampFile $UpdateCheckIntervalMinutes
 $updateResults = @()
-$versionFetches = @{}
 if ($updateDue) {
-  $versionFetches = @{
-    App    = Start-VersionFetch "$DistHost/version.txt"
-    Manual = Start-VersionFetch "$DistHost/manual_version.txt"
-    Ocr    = Start-VersionFetch "$DistHost/ocr_data_version.txt"
-  }
-  Wait-VersionFetches @($versionFetches.App, $versionFetches.Manual, $versionFetches.Ocr) $VersionCheckTimeoutMs
-
-  # 戻り値は必ず変数で受ける(受けないと、パイプライン/stdoutに文字列がそのまま出る --
-  # update_checker.ps1で実際に踏んだ罠)。
   $updateResults += Update-DistFile `
-    -RemoteVersionText (Get-FetchedVersion $versionFetches.App) `
+    -VersionUrl "$DistHost/version.txt" `
     -FileUrl "$DistHost/index.html" `
     -VersionFileName "version.txt" `
     -TargetFileName "index.html" `
@@ -278,7 +217,7 @@ if ($updateDue) {
     -AppliedMessagePrefix "PDF編集ツールを更新しました"
 
   $updateResults += Update-DistFile `
-    -RemoteVersionText (Get-FetchedVersion $versionFetches.Manual) `
+    -VersionUrl "$DistHost/manual_version.txt" `
     -FileUrl "$DistHost/PDF%E7%B7%A8%E9%9B%86%E3%83%84%E3%83%BC%E3%83%AB_%E5%88%A9%E7%94%A8%E3%83%9E%E3%83%8B%E3%83%A5%E3%82%A2%E3%83%AB.docx" `
     -VersionFileName "manual_version.txt" `
     -TargetFileName "PDF編集ツール_利用マニュアル.docx" `
@@ -357,7 +296,7 @@ function Wait-ForServerReady([int]$Port, [int]$MaxWaitMs) {
 # 落ちない。
 if ($updateDue) {
   $updateResults += Update-DistFile `
-    -RemoteVersionText (Get-FetchedVersion $versionFetches.Ocr) `
+    -VersionUrl "$DistHost/ocr_data_version.txt" `
     -FileUrl "$DistHost/ocr-data.bin" `
     -VersionFileName "ocr_data_version.txt" `
     -TargetFileName "ocr-data.bin" `
@@ -365,8 +304,7 @@ if ($updateDue) {
     -AppliedMessagePrefix "OCR用データを更新しました"
 
   # 3つとも、確認できた(最新だった・適用できた)ときだけ、成功した時刻を残す。
-  # 1つでも失敗(オフライン・時間切れ・ダウンロード失敗等)していたら残さない
-  # =次回の起動でまた確認する。
+  # 1つでも失敗(オフライン・ダウンロード失敗等)していたら残さない=次回の起動でまた確認する。
   if ($updateResults.Count -eq 3 -and -not ($updateResults -contains "failed")) {
     Write-UpdateCheckStamp $UpdateCheckStampFile
   }
